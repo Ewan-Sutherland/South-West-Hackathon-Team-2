@@ -7,3 +7,5 @@
 #Ready for Demo
 #Summarise the loaded transactions
 #run bills_tracker
+#Demo spending_dashboard
+
