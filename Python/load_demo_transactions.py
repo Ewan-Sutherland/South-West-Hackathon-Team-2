@@ -1,8 +1,8 @@
 import json, sys
 
-def parse_float(s):
+def parse_float(x):
     try:
-        return float(s)
+        return float(x)
     except Exception:
         return None
 
@@ -20,26 +20,40 @@ def main():
     parse_errors = 0
 
     for t in raw_txs:
-        amt = parse_float(t.get("amount", "0"))
-        usd = parse_float(t.get("usdValue", "0"))
-        if amt is None or usd is None:
+        # Amounts come in as strings in demo data
+        amt = parse_float(t.get("amount"))
+        usd = parse_float(t.get("usdValue"))
+
+        if amt is None:
             parse_errors += 1
             continue
 
-        direction = t.get("direction", "")
-        signed = -amt if direction == "debit" else amt
+        direction = (t.get("direction") or "").lower()
+        if direction == "debit":
+            signed_amount = -amt
+        elif direction == "credit":
+            signed_amount = amt
+        else:
+            # Unknown direction → skip
+            parse_errors += 1
+            continue
 
-        merchant = t.get("note") or t.get("type") or "unknown"
+        merchant = (
+            t.get("note")
+            or t.get("merchant")
+            or t.get("type")
+            or "unknown"
+        )
 
         out.append({
             "timestamp": t.get("createdAt", ""),
             "merchant": merchant,
-            "amount": signed,
+            "amount": signed_amount,           # signed: +income, -expense
             "currency": t.get("currency", ""),
             "id": t.get("id", ""),
             "type": t.get("type", ""),
             "status": t.get("status", ""),
-            "usdValue": usd,
+            "usdValue": usd if usd is not None else signed_amount,
         })
 
     sys.stdout.write(json.dumps({
