@@ -137,13 +137,6 @@ func runPy(ctx context.Context, script string, args []string, stdin []byte) ([]b
 	return out, nil
 }
 
-// Small helper for CORS so localhost:5173 can fetch the JSON without proxy.
-func setCORS(w http.ResponseWriter) {
-	w.Header().Set("Access-Control-Allow-Origin", "http://localhost:5173")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-}
-
 /* =======================
    Main
    ======================= */
@@ -322,7 +315,6 @@ What it does:
 				"analytics":          result,
 			}, nil
 		}).Build())
-
 	/* ---------- Tool 5: income_tracker ---------- */
 	srv.AddTool(tools.New("income_tracker").
 		Description(`
@@ -523,6 +515,7 @@ Important UI rule:
 
 			wallet, savings, today, lead := demo.Get()
 
+			// upcoming bills (auto today/lead)
 			upcomingPayload, _ := json.Marshal(map[string]interface{}{
 				"transactions": txs,
 				"today":        today,
@@ -556,6 +549,7 @@ Important UI rule:
 				return nil, fmt.Errorf("spend_guardrail.py returned invalid JSON: %v | output: %s", err, string(decisionOut))
 			}
 
+			// Pull recommended withdrawal (robustly)
 			recommended := 0.0
 			switch v := decision["recommended_savings_withdrawal"].(type) {
 			case float64:
@@ -565,6 +559,8 @@ Important UI rule:
 				recommended = f
 			}
 
+			// Build options:
+			// Always: Cancel
 			options := []map[string]interface{}{
 				{
 					"id":      "deny",
@@ -574,6 +570,7 @@ Important UI rule:
 				},
 			}
 
+			// If savings can help, show withdraw option (separate step)
 			if recommended > 0 {
 				options = append(options, map[string]interface{}{
 					"id":    "withdraw_from_savings",
@@ -586,6 +583,7 @@ Important UI rule:
 				})
 			}
 
+			// Only show normal send when guardrail says allow
 			if decision["decision"] == "allow" {
 				options = append(options, map[string]interface{}{
 					"id":    "proceed_send",
@@ -599,6 +597,7 @@ Important UI rule:
 				})
 			}
 
+			// Always show override (confirmation-required tool)
 			options = append(options, map[string]interface{}{
 				"id":    "override_send",
 				"label": "Override and send anyway",
@@ -630,7 +629,7 @@ Important UI rule:
 			}, nil
 		}).Build())
 
-	/* ---------- Tool 10: demo_withdraw_from_savings ---------- */
+	/* ---------- Tool 10: demo_withdraw_from_savings (separate step) ---------- */
 	srv.AddTool(tools.New("demo_withdraw_from_savings").
 		Description(`
 DEMO SAVINGS WITHDRAWAL (separate step).
@@ -696,7 +695,7 @@ Rules:
 			}, nil
 		}).Build())
 
-	/* ---------- Tool 11: demo_send_money_apply ---------- */
+	/* ---------- Tool 11: demo_send_money_apply (normal send; no confirmation) ---------- */
 	srv.AddTool(tools.New("demo_send_money_apply").
 		Description(`
 DEMO SEND (normal).
@@ -760,7 +759,7 @@ Note: This tool does not re-run guardrails. The guardrail is done by demo_send_m
 			}, nil
 		}).Build())
 
-	/* ---------- Tool 12: demo_send_money_override ---------- */
+	/* ---------- Tool 12: demo_send_money_override (confirmation required) ---------- */
 	srv.AddTool(tools.New("demo_send_money_override").
 		Description(`
 DEMO OVERRIDE SEND (requires confirmation).
@@ -824,142 +823,19 @@ Use this only if user explicitly chooses the override option.
 			}, nil
 		}).Build())
 
-	// ---------- Minimal local web dashboard + frontend JSON endpoints ----------
+	// ---------- Minimal local web dashboard (read-only) ----------
 	// Runs on :8090 so it doesn't interfere with the NIM server.
 	// Endpoints:
-	//   http://localhost:8090/dashboard       (HTML)
-	//   http://localhost:8090/dashboard.json  (raw analytics JSON)
-	//   http://localhost:8090/state.json      (wallet+savings for the 5173 page)
-	//   http://localhost:8090/income.json     (auto-run income_tracker for side panel)
-	//   http://localhost:8090/bills.json      (auto-run bills_tracker + upcoming_bills for side panel)
-
-	http.HandleFunc("/state.json", func(w http.ResponseWriter, r *http.Request) {
-		setCORS(w)
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-
-		wallet, savings, today, lead := demo.Get()
-		resp := map[string]interface{}{
-			"wallet_balance":  wallet,
-			"savings_balance": savings,
-			"today":           today,
-			"lead_days":       lead,
-			"loaded":          len(store.Get()) > 0,
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(resp)
-	})
-
-	// NEW: income.json (for the left panel)
-	http.HandleFunc("/income.json", func(w http.ResponseWriter, r *http.Request) {
-		setCORS(w)
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-
-		txs := store.Get()
-		if len(txs) == 0 {
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"error":"No transactions loaded. Run 'ready_for_demo' first."}`))
-			return
-		}
-
-		stdin, _ := json.Marshal(map[string]interface{}{
-			"transactions": txs,
-		})
-		out, err := runPy(r.Context(), "python/income_tracker.py", nil, stdin)
-		if err != nil {
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(fmt.Sprintf(`{"error":"%s"}`, err.Error())))
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(out)
-	})
-
-	// NEW: bills.json (for the right panel) – merges recurring + upcoming
-	http.HandleFunc("/bills.json", func(w http.ResponseWriter, r *http.Request) {
-		setCORS(w)
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-
-		txs := store.Get()
-		if len(txs) == 0 {
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"error":"No transactions loaded. Run 'ready_for_demo' first."}`))
-			return
-		}
-
-		_, _, today, lead := demo.Get()
-
-		// 1) recurring bills
-		stdinBills, _ := json.Marshal(map[string]interface{}{
-			"transactions": txs,
-		})
-		billsOut, err := runPy(r.Context(), "python/bills_tracker.py", nil, stdinBills)
-		if err != nil {
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(fmt.Sprintf(`{"error":"%s"}`, err.Error())))
-			return
-		}
-
-		// 2) upcoming bills (lead window)
-		stdinUpcoming, _ := json.Marshal(map[string]interface{}{
-			"transactions": txs,
-			"today":        today,
-			"lead_days":    lead,
-		})
-		upOut, err := runPy(r.Context(), "python/upcoming_bills.py", nil, stdinUpcoming)
-		if err != nil {
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(fmt.Sprintf(`{"error":"%s"}`, err.Error())))
-			return
-		}
-
-		// Merge JSON into one object for frontend simplicity
-		var billsObj map[string]interface{}
-		if err := json.Unmarshal(billsOut, &billsObj); err != nil {
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(fmt.Sprintf(`{"error":"bills_tracker invalid JSON: %s"}`, err.Error())))
-			return
-		}
-
-		var upObj map[string]interface{}
-		if err := json.Unmarshal(upOut, &upObj); err != nil {
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(fmt.Sprintf(`{"error":"upcoming_bills invalid JSON: %s"}`, err.Error())))
-			return
-		}
-
-		// Normalize for frontend:
-		// billsObj might have recurring lists under different keys depending on your script;
-		// we add these universally:
-		billsObj["today"] = today
-		billsObj["lead_days"] = lead
-		billsObj["upcoming_bills"] = upObj["upcoming_bills"]
-		billsObj["total_upcoming_bills"] = upObj["total_upcoming_bills"]
-
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(billsObj)
-	})
+	//   http://localhost:8090/dashboard      (HTML)
+	//   http://localhost:8090/dashboard.json (raw JSON)
+	//
+	// Uses the same source of truth as tools: in-memory TxStore (loaded by ready_for_demo).
 
 	http.HandleFunc("/dashboard.json", func(w http.ResponseWriter, r *http.Request) {
-		setCORS(w)
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-
 		txs := store.Get()
 		if len(txs) == 0 {
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"error":"No transactions loaded. Run 'ready_for_demo' first."}`))
+			_, _ = w.Write([]byte(`{"error":"No transactions loaded. Run 'ready for demo' first."}`))
 			return
 		}
 
@@ -1024,31 +900,172 @@ Use this only if user explicitly chooses the override option.
 <body>
   <h1>NIM Demo Spending Dashboard</h1>
   <div class="muted">
-    Source: in-memory demo transactions. Refresh after <code>ready for demo</code>.
-    JSON: <a href="/dashboard.json">/dashboard.json</a>
-    | State: <a href="/state.json">/state.json</a>
-    | Income: <a href="/income.json">/income.json</a>
-    | Bills: <a href="/bills.json">/bills.json</a>
+    Source: in-memory demo transactions. Refresh after <code>ready for demo</code>. JSON: <a href="/dashboard.json">/dashboard.json</a>
   </div>
 
   <script id="data" type="application/json">` + string(out) + `</script>
   <script>
-    // unchanged dashboard script...
-  </script>
+  const data = JSON.parse(document.getElementById("data").textContent || "{}");
+
+  function get(obj, path, fallback) {
+    try {
+      return path.reduce((acc, k) => (acc && acc[k] !== undefined ? acc[k] : undefined), obj) ?? fallback;
+    } catch (e) {
+      return fallback;
+    }
+  }
+
+  function money(x){
+    const cur = (data.summary && data.summary.currency) ? data.summary.currency : "GBP";
+    return cur + " " + (Number(x || 0).toFixed(2));
+  }
+
+  function renderTable(container, rows, cols){
+    const table = document.createElement("table");
+    const thead = document.createElement("thead");
+    const trh = document.createElement("tr");
+    cols.forEach(c=>{
+      const th=document.createElement("th"); th.textContent=c.label; trh.appendChild(th);
+    });
+    thead.appendChild(trh); table.appendChild(thead);
+
+    const tb = document.createElement("tbody");
+    (rows || []).forEach(r=>{
+      const tr=document.createElement("tr");
+      cols.forEach(c=>{
+        const td=document.createElement("td");
+        const val = (r && r[c.key] !== undefined) ? r[c.key] : "";
+        td.textContent = c.f ? c.f(val, r) : String(val);
+        tr.appendChild(td);
+      });
+      tb.appendChild(tr);
+    });
+    table.appendChild(tb);
+    container.appendChild(table);
+  }
+
+  function renderBars(container, rows, labelKey, valueKey){
+    rows = rows || [];
+    let max = 1;
+    rows.forEach(r=>{ max = Math.max(max, Number(r && r[valueKey] || 0)); });
+
+    rows.forEach(r=>{
+      const wrap=document.createElement("div");
+      wrap.style.margin="10px 0";
+      const top=document.createElement("div");
+      top.style.display="flex";
+      top.style.justifyContent="space-between";
+      top.style.gap="10px";
+
+      const left = document.createElement("div");
+      left.textContent = (r && r[labelKey]) ? String(r[labelKey]) : "";
+      const right = document.createElement("div");
+      right.className = "muted";
+      right.textContent = money(r && r[valueKey]);
+
+      top.appendChild(left);
+      top.appendChild(right);
+
+      const bar=document.createElement("div");
+      bar.className="bar";
+      bar.style.width = (Math.round((Number(r && r[valueKey] || 0)/max)*100)) + "%";
+      wrap.appendChild(top);
+      wrap.appendChild(bar);
+      container.appendChild(wrap);
+    });
+  }
+
+  const root = document.body;
+
+  const summaryCard = document.createElement("div");
+  summaryCard.className="card";
+  const income = get(data, ["summary","income_total"], 0);
+  const spend = get(data, ["summary","spend_total"], 0);
+  const net = get(data, ["summary","net"], 0);
+  const excludedCount = get(data, ["exclusions","internal_transfers_excluded_from_rankings","count"], 0);
+
+  summaryCard.innerHTML =
+    '<h2>Summary</h2>' +
+    '<div><b>Income:</b> ' + money(income) + '</div>' +
+    '<div><b>Spend:</b> ' + money(spend) + '</div>' +
+    '<div><b>Net:</b> ' + money(net) + '</div>' +
+    '<div class="muted" style="margin-top:8px;">' +
+      'Internal transfers excluded from rankings: ' + String(excludedCount) +
+    '</div>';
+
+  const merchantsCard = document.createElement("div");
+  merchantsCard.className="card";
+  merchantsCard.innerHTML = '<h2>Top merchants (6 months)</h2>';
+  renderBars(merchantsCard, get(data, ["rankings","top_merchants"], []), "merchant", "total");
+
+  const catsCard = document.createElement("div");
+  catsCard.className="card";
+  catsCard.innerHTML = '<h2>Top categories (6 months)</h2>';
+  renderBars(catsCard, get(data, ["rankings","top_categories"], []), "category", "total");
+
+  const recurringCard = document.createElement("div");
+  recurringCard.className="card";
+  recurringCard.innerHTML = '<h2>Recurring payments (heuristic)</h2>';
+  renderTable(recurringCard, get(data, ["recurring_payments"], []), [
+    {key:"merchant", label:"Merchant"},
+    {key:"months_seen", label:"Months"},
+    {key:"total", label:"Total", f:(v)=>money(v)},
+    {key:"count", label:"Tx"},
+  ]);
+
+  const cutsCard = document.createElement("div");
+  cutsCard.className="card";
+  cutsCard.innerHTML = '<h2>Potential cuts (demo hints)</h2>';
+  renderTable(cutsCard, get(data, ["spending_cuts"], []), [
+    {key:"category", label:"Category"},
+    {key:"monthly_saving_hint", label:"~Monthly", f:(v)=>money(v)},
+    {key:"total_6mo", label:"6mo total", f:(v)=>money(v)},
+  ]);
+
+  const ratingsCard = document.createElement("div");
+  ratingsCard.className="card";
+  ratingsCard.innerHTML = '<h2>Recent rated spend (sample)</h2>';
+  const rows = get(data, ["transaction_ratings"], []).slice(0, 30);
+
+  const t = document.createElement("table");
+  t.innerHTML = '<thead><tr><th>Date</th><th>Merchant</th><th>Category</th><th>Amount</th><th>Risk</th></tr></thead>';
+  const tb = document.createElement("tbody");
+  rows.forEach(r=>{
+    const tr=document.createElement("tr");
+    const rating = (r && r.rating) ? String(r.rating) : "green";
+    const pillClass = rating === "amber" ? "amber" : (rating === "red" ? "red" : "green");
+    const pill = '<span class="pill ' + pillClass + '">' + rating + '</span>';
+    tr.innerHTML =
+      '<td>' + (r.timestamp||"") + '</td>' +
+      '<td>' + (r.merchant||"") + '</td>' +
+      '<td>' + (r.category||"") + '</td>' +
+      '<td>' + money(r.amount) + '</td>' +
+      '<td>' + pill + '</td>';
+    tb.appendChild(tr);
+  });
+  t.appendChild(tb);
+  ratingsCard.appendChild(t);
+
+  const row1=document.createElement("div"); row1.className="row";
+  row1.appendChild(summaryCard); row1.appendChild(merchantsCard); row1.appendChild(catsCard);
+
+  const row2=document.createElement("div"); row2.className="row";
+  row2.appendChild(recurringCard); row2.appendChild(cutsCard); row2.appendChild(ratingsCard);
+
+  root.appendChild(row1);
+  root.appendChild(row2);
+</script>
 </body>
 </html>`))
 	})
 
 	go func() {
 		log.Println("Spending dashboard: http://localhost:8090/dashboard")
-		log.Println("State JSON for frontend: http://localhost:8090/state.json")
-		log.Println("Income JSON for frontend: http://localhost:8090/income.json")
-		log.Println("Bills JSON for frontend: http://localhost:8090/bills.json")
 		if err := http.ListenAndServe(":8090", nil); err != nil {
 			log.Println("dashboard server stopped:", err)
 		}
 	}()
 
 	log.Println("Nim demo server running on :8080")
-	_ = srv.Run(":8080")
+	srv.Run(":8080")
 }

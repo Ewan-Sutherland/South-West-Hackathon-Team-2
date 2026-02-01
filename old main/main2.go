@@ -137,13 +137,6 @@ func runPy(ctx context.Context, script string, args []string, stdin []byte) ([]b
 	return out, nil
 }
 
-// Small helper for CORS so localhost:5173 can fetch the JSON without proxy.
-func setCORS(w http.ResponseWriter) {
-	w.Header().Set("Access-Control-Allow-Origin", "http://localhost:5173")
-	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-}
-
 /* =======================
    Main
    ======================= */
@@ -523,6 +516,7 @@ Important UI rule:
 
 			wallet, savings, today, lead := demo.Get()
 
+			// upcoming bills (auto today/lead)
 			upcomingPayload, _ := json.Marshal(map[string]interface{}{
 				"transactions": txs,
 				"today":        today,
@@ -556,6 +550,7 @@ Important UI rule:
 				return nil, fmt.Errorf("spend_guardrail.py returned invalid JSON: %v | output: %s", err, string(decisionOut))
 			}
 
+			// Pull recommended withdrawal (robustly)
 			recommended := 0.0
 			switch v := decision["recommended_savings_withdrawal"].(type) {
 			case float64:
@@ -565,6 +560,8 @@ Important UI rule:
 				recommended = f
 			}
 
+			// Build options:
+			// Always: Cancel
 			options := []map[string]interface{}{
 				{
 					"id":      "deny",
@@ -574,6 +571,7 @@ Important UI rule:
 				},
 			}
 
+			// If savings can help, show withdraw option (separate step)
 			if recommended > 0 {
 				options = append(options, map[string]interface{}{
 					"id":    "withdraw_from_savings",
@@ -586,6 +584,7 @@ Important UI rule:
 				})
 			}
 
+			// Only show normal send when guardrail says allow
 			if decision["decision"] == "allow" {
 				options = append(options, map[string]interface{}{
 					"id":    "proceed_send",
@@ -599,6 +598,7 @@ Important UI rule:
 				})
 			}
 
+			// Always show override (confirmation-required tool)
 			options = append(options, map[string]interface{}{
 				"id":    "override_send",
 				"label": "Override and send anyway",
@@ -630,7 +630,7 @@ Important UI rule:
 			}, nil
 		}).Build())
 
-	/* ---------- Tool 10: demo_withdraw_from_savings ---------- */
+	/* ---------- Tool 10: demo_withdraw_from_savings (separate step) ---------- */
 	srv.AddTool(tools.New("demo_withdraw_from_savings").
 		Description(`
 DEMO SAVINGS WITHDRAWAL (separate step).
@@ -696,7 +696,7 @@ Rules:
 			}, nil
 		}).Build())
 
-	/* ---------- Tool 11: demo_send_money_apply ---------- */
+	/* ---------- Tool 11: demo_send_money_apply (normal send; no confirmation) ---------- */
 	srv.AddTool(tools.New("demo_send_money_apply").
 		Description(`
 DEMO SEND (normal).
@@ -760,7 +760,7 @@ Note: This tool does not re-run guardrails. The guardrail is done by demo_send_m
 			}, nil
 		}).Build())
 
-	/* ---------- Tool 12: demo_send_money_override ---------- */
+	/* ---------- Tool 12: demo_send_money_override (confirmation required) ---------- */
 	srv.AddTool(tools.New("demo_send_money_override").
 		Description(`
 DEMO OVERRIDE SEND (requires confirmation).
@@ -824,142 +824,19 @@ Use this only if user explicitly chooses the override option.
 			}, nil
 		}).Build())
 
-	// ---------- Minimal local web dashboard + frontend JSON endpoints ----------
+	// ---------- Minimal local web dashboard (read-only) ----------
 	// Runs on :8090 so it doesn't interfere with the NIM server.
 	// Endpoints:
-	//   http://localhost:8090/dashboard       (HTML)
-	//   http://localhost:8090/dashboard.json  (raw analytics JSON)
-	//   http://localhost:8090/state.json      (wallet+savings for the 5173 page)
-	//   http://localhost:8090/income.json     (auto-run income_tracker for side panel)
-	//   http://localhost:8090/bills.json      (auto-run bills_tracker + upcoming_bills for side panel)
-
-	http.HandleFunc("/state.json", func(w http.ResponseWriter, r *http.Request) {
-		setCORS(w)
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-
-		wallet, savings, today, lead := demo.Get()
-		resp := map[string]interface{}{
-			"wallet_balance":  wallet,
-			"savings_balance": savings,
-			"today":           today,
-			"lead_days":       lead,
-			"loaded":          len(store.Get()) > 0,
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(resp)
-	})
-
-	// NEW: income.json (for the left panel)
-	http.HandleFunc("/income.json", func(w http.ResponseWriter, r *http.Request) {
-		setCORS(w)
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-
-		txs := store.Get()
-		if len(txs) == 0 {
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"error":"No transactions loaded. Run 'ready_for_demo' first."}`))
-			return
-		}
-
-		stdin, _ := json.Marshal(map[string]interface{}{
-			"transactions": txs,
-		})
-		out, err := runPy(r.Context(), "python/income_tracker.py", nil, stdin)
-		if err != nil {
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(fmt.Sprintf(`{"error":"%s"}`, err.Error())))
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(out)
-	})
-
-	// NEW: bills.json (for the right panel) – merges recurring + upcoming
-	http.HandleFunc("/bills.json", func(w http.ResponseWriter, r *http.Request) {
-		setCORS(w)
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-
-		txs := store.Get()
-		if len(txs) == 0 {
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"error":"No transactions loaded. Run 'ready_for_demo' first."}`))
-			return
-		}
-
-		_, _, today, lead := demo.Get()
-
-		// 1) recurring bills
-		stdinBills, _ := json.Marshal(map[string]interface{}{
-			"transactions": txs,
-		})
-		billsOut, err := runPy(r.Context(), "python/bills_tracker.py", nil, stdinBills)
-		if err != nil {
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(fmt.Sprintf(`{"error":"%s"}`, err.Error())))
-			return
-		}
-
-		// 2) upcoming bills (lead window)
-		stdinUpcoming, _ := json.Marshal(map[string]interface{}{
-			"transactions": txs,
-			"today":        today,
-			"lead_days":    lead,
-		})
-		upOut, err := runPy(r.Context(), "python/upcoming_bills.py", nil, stdinUpcoming)
-		if err != nil {
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(fmt.Sprintf(`{"error":"%s"}`, err.Error())))
-			return
-		}
-
-		// Merge JSON into one object for frontend simplicity
-		var billsObj map[string]interface{}
-		if err := json.Unmarshal(billsOut, &billsObj); err != nil {
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(fmt.Sprintf(`{"error":"bills_tracker invalid JSON: %s"}`, err.Error())))
-			return
-		}
-
-		var upObj map[string]interface{}
-		if err := json.Unmarshal(upOut, &upObj); err != nil {
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(fmt.Sprintf(`{"error":"upcoming_bills invalid JSON: %s"}`, err.Error())))
-			return
-		}
-
-		// Normalize for frontend:
-		// billsObj might have recurring lists under different keys depending on your script;
-		// we add these universally:
-		billsObj["today"] = today
-		billsObj["lead_days"] = lead
-		billsObj["upcoming_bills"] = upObj["upcoming_bills"]
-		billsObj["total_upcoming_bills"] = upObj["total_upcoming_bills"]
-
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(billsObj)
-	})
+	//   http://localhost:8090/dashboard      (HTML)
+	//   http://localhost:8090/dashboard.json (raw JSON)
+	//
+	// Uses the same source of truth as tools: in-memory TxStore (loaded by ready_for_demo).
 
 	http.HandleFunc("/dashboard.json", func(w http.ResponseWriter, r *http.Request) {
-		setCORS(w)
-		if r.Method == http.MethodOptions {
-			w.WriteHeader(http.StatusNoContent)
-			return
-		}
-
 		txs := store.Get()
 		if len(txs) == 0 {
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(`{"error":"No transactions loaded. Run 'ready_for_demo' first."}`))
+			_, _ = w.Write([]byte(`{"error":"No transactions loaded. Run 'ready for demo' first."}`))
 			return
 		}
 
@@ -974,8 +851,28 @@ Use this only if user explicitly chooses the override option.
 			return
 		}
 
+		// NEW: wrap analytics with context (bank + savings balances)
+		var analytics interface{}
+		if err := json.Unmarshal(out, &analytics); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"error":"invalid analytics json: %s"}`, err.Error())))
+			return
+		}
+
+		wallet, savings, today, leadDays := demo.Get()
+		resp := map[string]interface{}{
+			"context": map[string]interface{}{
+				"bank_balance":    wallet,
+				"savings_balance": savings,
+				"today":           today,
+				"lead_days":       leadDays,
+			},
+			"analytics": analytics,
+		}
+
+		b, _ := json.Marshal(resp)
 		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(out)
+		_, _ = w.Write(b)
 	})
 
 	http.HandleFunc("/dashboard", func(w http.ResponseWriter, r *http.Request) {
@@ -997,6 +894,26 @@ Use this only if user explicitly chooses the override option.
 			return
 		}
 
+		// NEW: embed context + analytics for the UI
+		var analytics interface{}
+		if err := json.Unmarshal(out, &analytics); err != nil {
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = w.Write([]byte(`<h2>Error</h2><pre>Invalid analytics JSON: ` + err.Error() + `</pre>`))
+			return
+		}
+
+		wallet, savings, today, leadDays := demo.Get()
+		page := map[string]interface{}{
+			"context": map[string]interface{}{
+				"bank_balance":    wallet,
+				"savings_balance": savings,
+				"today":           today,
+				"lead_days":       leadDays,
+			},
+			"analytics": analytics,
+		}
+		pageJSON, _ := json.Marshal(page)
+
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = w.Write([]byte(`<!doctype html>
 <html>
@@ -1007,9 +924,10 @@ Use this only if user explicitly chooses the override option.
   <style>
     body{font-family:system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin:24px; color:#111;}
     .row{display:flex; gap:18px; flex-wrap:wrap;}
-    .card{border:1px solid #e5e7eb; border-radius:14px; padding:16px; box-shadow:0 1px 2px rgba(0,0,0,0.04); min-width:320px; flex:1;}
+    .card{border:1px solid #e5e7eb; border-radius:16px; padding:16px; box-shadow:0 1px 2px rgba(0,0,0,0.04); min-width:320px; flex:1;}
     h1{font-size:20px; margin:0 0 10px;}
     h2{font-size:14px; margin:0 0 10px; color:#374151;}
+    .big{font-size:28px; font-weight:750; margin-top:6px;}
     table{width:100%; border-collapse:collapse; font-size:13px;}
     th, td{padding:8px 6px; border-bottom:1px solid #f1f5f9; text-align:left;}
     .bar{height:10px; background:#111; border-radius:999px;}
@@ -1019,6 +937,8 @@ Use this only if user explicitly chooses the override option.
     .amber{background:#fffbeb;}
     .red{background:#fef2f2;}
     code{background:#f3f4f6; padding:2px 6px; border-radius:6px;}
+    input{outline:none;}
+    button{outline:none;}
   </style>
 </head>
 <body>
@@ -1026,29 +946,257 @@ Use this only if user explicitly chooses the override option.
   <div class="muted">
     Source: in-memory demo transactions. Refresh after <code>ready for demo</code>.
     JSON: <a href="/dashboard.json">/dashboard.json</a>
-    | State: <a href="/state.json">/state.json</a>
-    | Income: <a href="/income.json">/income.json</a>
-    | Bills: <a href="/bills.json">/bills.json</a>
   </div>
 
-  <script id="data" type="application/json">` + string(out) + `</script>
+  <script id="data" type="application/json">` + string(pageJSON) + `</script>
   <script>
-    // unchanged dashboard script...
-  </script>
+  const data = JSON.parse(document.getElementById("data").textContent || "{}");
+  const ctx = data.context || {};
+  const a = data.analytics || {};
+
+  function get(obj, path, fallback) {
+    try {
+      // avoid optional chaining; keep deterministic / compatible
+      let cur = obj;
+      for (let i = 0; i < path.length; i++) {
+        if (!cur || cur[path[i]] === undefined) return fallback;
+        cur = cur[path[i]];
+      }
+      return cur === undefined ? fallback : cur;
+    } catch (e) {
+      return fallback;
+    }
+  }
+
+  function money(x){
+    const cur = (a.summary && a.summary.currency) ? a.summary.currency : "GBP";
+    return cur + " " + (Number(x || 0).toFixed(2));
+  }
+
+  function renderTable(container, rows, cols){
+    const table = document.createElement("table");
+    const thead = document.createElement("thead");
+    const trh = document.createElement("tr");
+    cols.forEach(c=>{
+      const th=document.createElement("th"); th.textContent=c.label; trh.appendChild(th);
+    });
+    thead.appendChild(trh); table.appendChild(thead);
+
+    const tb = document.createElement("tbody");
+    (rows || []).forEach(r=>{
+      const tr=document.createElement("tr");
+      cols.forEach(c=>{
+        const td=document.createElement("td");
+        const val = (r && r[c.key] !== undefined) ? r[c.key] : "";
+        td.textContent = c.f ? c.f(val, r) : String(val);
+        tr.appendChild(td);
+      });
+      tb.appendChild(tr);
+    });
+    table.appendChild(tb);
+    container.appendChild(table);
+  }
+
+  function renderBars(container, rows, labelKey, valueKey){
+    rows = rows || [];
+    let max = 1;
+    rows.forEach(r=>{ max = Math.max(max, Number(r && r[valueKey] || 0)); });
+
+    rows.forEach(r=>{
+      const wrap=document.createElement("div");
+      wrap.style.margin="10px 0";
+      const top=document.createElement("div");
+      top.style.display="flex";
+      top.style.justifyContent="space-between";
+      top.style.gap="10px";
+
+      const left = document.createElement("div");
+      left.textContent = (r && r[labelKey]) ? String(r[labelKey]) : "";
+      const right = document.createElement("div");
+      right.className = "muted";
+      right.textContent = money(r && r[valueKey]);
+
+      top.appendChild(left);
+      top.appendChild(right);
+
+      const bar=document.createElement("div");
+      bar.className="bar";
+      bar.style.width = (Math.round((Number(r && r[valueKey] || 0)/max)*100)) + "%";
+      wrap.appendChild(top);
+      wrap.appendChild(bar);
+      container.appendChild(wrap);
+    });
+  }
+
+  // ---------- TOP ROW: Bank balance + Savings balance + Send money ----------
+  const topRow = document.createElement("div");
+  topRow.className = "row";
+
+  function makeBalanceCard(title, value){
+    const card = document.createElement("div");
+    card.className = "card";
+    const meta = "As of: " + (ctx.today || "—") + " | lead window: " + String(ctx.lead_days ?? "—") + " days";
+    card.innerHTML =
+      '<h2>' + title + '</h2>' +
+      '<div class="big">' + money(value) + '</div>' +
+      '<div class="muted" style="margin-top:8px;">' + meta + '</div>';
+    return card;
+  }
+
+  const bankCard = makeBalanceCard("Bank balance", ctx.bank_balance);
+  const savingsCard = makeBalanceCard("Savings balance", ctx.savings_balance);
+
+  const actionsCard = document.createElement("div");
+  actionsCard.className = "card";
+  actionsCard.innerHTML =
+    '<h2>Quick actions</h2>' +
+    '<button id="sendBtn" style="padding:10px 12px; border-radius:12px; border:1px solid #e5e7eb; background:#111; color:#fff; cursor:pointer;">Send money</button>' +
+    '<div id="sendForm" style="display:none; margin-top:12px;">' +
+      '<div class="muted" style="margin-bottom:8px;">This generates a Nim Chat command so guardrails + confirmation still run.</div>' +
+      '<div style="display:flex; gap:10px; flex-wrap:wrap;">' +
+        '<input id="toInput" placeholder="@alice" style="flex:1; min-width:140px; padding:10px; border:1px solid #e5e7eb; border-radius:12px;" />' +
+        '<input id="amtInput" placeholder="Amount" type="number" step="0.01" style="width:140px; padding:10px; border:1px solid #e5e7eb; border-radius:12px;" />' +
+      '</div>' +
+      '<div style="display:flex; gap:10px; margin-top:10px; flex-wrap:wrap;">' +
+        '<button id="genCmdBtn" style="padding:10px 12px; border-radius:12px; border:1px solid #e5e7eb; background:#fff; cursor:pointer;">Generate command</button>' +
+        '<button id="copyCmdBtn" style="padding:10px 12px; border-radius:12px; border:1px solid #e5e7eb; background:#fff; cursor:pointer;" disabled>Copy</button>' +
+        '<a href="http://localhost:5173" target="_blank" rel="noreferrer" style="padding:10px 12px; border-radius:12px; border:1px solid #e5e7eb; text-decoration:none; color:#111;">Open Nim Chat</a>' +
+      '</div>' +
+      '<pre id="cmdOut" style="margin-top:10px; background:#f3f4f6; padding:10px; border-radius:12px; white-space:pre-wrap;"></pre>' +
+    '</div>';
+
+  topRow.appendChild(bankCard);
+  topRow.appendChild(savingsCard);
+  topRow.appendChild(actionsCard);
+  document.body.appendChild(topRow);
+
+  document.getElementById("sendBtn").addEventListener("click", function(){
+    const form = document.getElementById("sendForm");
+    form.style.display = (form.style.display === "none") ? "block" : "none";
+  });
+
+  document.getElementById("genCmdBtn").addEventListener("click", function(){
+    const to = (document.getElementById("toInput").value || "").trim();
+    const amt = (document.getElementById("amtInput").value || "").trim();
+    const cmdOut = document.getElementById("cmdOut");
+    const copyBtn = document.getElementById("copyCmdBtn");
+
+    if (!to || !amt) {
+      cmdOut.textContent = "Enter both recipient (e.g. @alice) and amount.";
+      copyBtn.disabled = true;
+      return;
+    }
+
+    const cmd = "demo_send_money to " + to + " amount " + amt;
+    cmdOut.textContent = "Paste this into Nim Chat:\n\n" + cmd + "\n\n(Guardrails will run before any funds move.)";
+    copyBtn.disabled = false;
+    copyBtn.dataset.cmd = cmd;
+  });
+
+  document.getElementById("copyCmdBtn").addEventListener("click", async function(e){
+    const cmd = e.target.dataset.cmd || "";
+    if (!cmd) return;
+    const cmdOut = document.getElementById("cmdOut");
+    try {
+      await navigator.clipboard.writeText(cmd);
+      cmdOut.textContent = cmdOut.textContent + "\n\n✅ Copied to clipboard.";
+    } catch (err) {
+      cmdOut.textContent = cmdOut.textContent + "\n\n(Clipboard blocked — manually copy the line.)";
+    }
+  });
+
+  // ---------- Existing analytics sections ----------
+  const root = document.body;
+
+  const summaryCard = document.createElement("div");
+  summaryCard.className="card";
+  const income = get(a, ["summary","income_total"], 0);
+  const spend = get(a, ["summary","spend_total"], 0);
+  const net = get(a, ["summary","net"], 0);
+  const excludedCount = get(a, ["exclusions","internal_transfers_excluded_from_rankings","count"], 0);
+
+  summaryCard.innerHTML =
+    '<h2>Summary</h2>' +
+    '<div><b>Income:</b> ' + money(income) + '</div>' +
+    '<div><b>Spend:</b> ' + money(spend) + '</div>' +
+    '<div><b>Net:</b> ' + money(net) + '</div>' +
+    '<div class="muted" style="margin-top:8px;">' +
+      'Internal transfers excluded from rankings: ' + String(excludedCount) +
+    '</div>';
+
+  const merchantsCard = document.createElement("div");
+  merchantsCard.className="card";
+  merchantsCard.innerHTML = '<h2>Top merchants (6 months)</h2>';
+  renderBars(merchantsCard, get(a, ["rankings","top_merchants"], []), "merchant", "total");
+
+  const catsCard = document.createElement("div");
+  catsCard.className="card";
+  catsCard.innerHTML = '<h2>Top categories (6 months)</h2>';
+  renderBars(catsCard, get(a, ["rankings","top_categories"], []), "category", "total");
+
+  const recurringCard = document.createElement("div");
+  recurringCard.className="card";
+  recurringCard.innerHTML = '<h2>Recurring payments (heuristic)</h2>';
+  renderTable(recurringCard, get(a, ["recurring_payments"], []), [
+    {key:"merchant", label:"Merchant"},
+    {key:"months_seen", label:"Months"},
+    {key:"total", label:"Total", f:(v)=>money(v)},
+    {key:"count", label:"Tx"},
+  ]);
+
+  const cutsCard = document.createElement("div");
+  cutsCard.className="card";
+  cutsCard.innerHTML = '<h2>Potential cuts (demo hints)</h2>';
+  renderTable(cutsCard, get(a, ["spending_cuts"], []), [
+    {key:"category", label:"Category"},
+    {key:"monthly_saving_hint", label:"~Monthly", f:(v)=>money(v)},
+    {key:"total_6mo", label:"6mo total", f:(v)=>money(v)},
+  ]);
+
+  const ratingsCard = document.createElement("div");
+  ratingsCard.className="card";
+  ratingsCard.innerHTML = '<h2>Recent rated spend (sample)</h2>';
+  const rows = get(a, ["transaction_ratings"], []).slice(0, 30);
+
+  const t = document.createElement("table");
+  t.innerHTML = '<thead><tr><th>Date</th><th>Merchant</th><th>Category</th><th>Amount</th><th>Risk</th></tr></thead>';
+  const tb = document.createElement("tbody");
+  rows.forEach(r=>{
+    const tr=document.createElement("tr");
+    const rating = (r && r.rating) ? String(r.rating) : "green";
+    const pillClass = rating === "amber" ? "amber" : (rating === "red" ? "red" : "green");
+    const pill = '<span class="pill ' + pillClass + '">' + rating + '</span>';
+    tr.innerHTML =
+      '<td>' + (r.timestamp||"") + '</td>' +
+      '<td>' + (r.merchant||"") + '</td>' +
+      '<td>' + (r.category||"") + '</td>' +
+      '<td>' + money(r.amount) + '</td>' +
+      '<td>' + pill + '</td>';
+    tb.appendChild(tr);
+  });
+  t.appendChild(tb);
+  ratingsCard.appendChild(t);
+
+  const row1=document.createElement("div"); row1.className="row";
+  row1.appendChild(summaryCard); row1.appendChild(merchantsCard); row1.appendChild(catsCard);
+
+  const row2=document.createElement("div"); row2.className="row";
+  row2.appendChild(recurringCard); row2.appendChild(cutsCard); row2.appendChild(ratingsCard);
+
+  root.appendChild(row1);
+  root.appendChild(row2);
+</script>
 </body>
 </html>`))
 	})
 
 	go func() {
 		log.Println("Spending dashboard: http://localhost:8090/dashboard")
-		log.Println("State JSON for frontend: http://localhost:8090/state.json")
-		log.Println("Income JSON for frontend: http://localhost:8090/income.json")
-		log.Println("Bills JSON for frontend: http://localhost:8090/bills.json")
 		if err := http.ListenAndServe(":8090", nil); err != nil {
 			log.Println("dashboard server stopped:", err)
 		}
 	}()
 
 	log.Println("Nim demo server running on :8080")
-	_ = srv.Run(":8080")
+	srv.Run(":8080")
 }
