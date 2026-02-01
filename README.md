@@ -7,9 +7,11 @@
 
 
 #Commands to run: 
-#Ready for Demo
-#Summarise the loaded transactions
+#Ready_for_Demo
+#Summarise_the_loaded_transactions
 #run bills_tracker
+
+#(if website doesnt work run: demo_send_money to @alice amount 300     make sure ran ready_for_demo first)
 
 
 
