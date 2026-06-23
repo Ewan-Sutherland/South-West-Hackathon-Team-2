@@ -7,9 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 INTERNAL_TYPES = {"deposit_savings_demo", "withdraw_savings_demo"}
 
-# ---------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------
+
 def safe_float(x: Any, default: float = 0.0) -> float:
     try:
         return float(x)
@@ -21,7 +19,7 @@ def parse_dt(ts: str) -> Optional[datetime]:
     if not ts:
         return None
     try:
-        # Accept "YYYY-MM-DD" or ISO like "YYYY-MM-DDTHH:MM:SSZ"
+        # accept "YYYY-MM-DD" or ISO like "YYYY-MM-DDTHH:MM:SSZ"
         if "T" in ts:
             return datetime.fromisoformat(ts.replace("Z", "+00:00"))
         return datetime.fromisoformat(ts)
@@ -34,7 +32,7 @@ def month_key(dt: datetime) -> str:
 
 
 def normalize_merchant(t: Dict[str, Any]) -> str:
-    # Keep close to your normalized schema but tolerate variations
+    # tolerate minor schema variations
     m = t.get("merchant") or t.get("Merchant") or t.get("counterparty") or ""
     return str(m).strip() or "Unknown"
 
@@ -57,7 +55,7 @@ def categorize(merchant: str, raw_type: str) -> str:
     if raw_type in INTERNAL_TYPES:
         return "internal_transfer"
 
-    # Deterministic rules (demo-friendly, no ML)
+    # keyword-based category rules
     if "rent" in m or "landlord" in m:
         return "housing_rent"
     if any(k in m for k in ["council", "electric", "gas", "water", "utility", "internet", "broadband", "phone"]):
@@ -79,7 +77,7 @@ def categorize(merchant: str, raw_type: str) -> str:
 
 
 def is_questionable(category: str, merchant: str) -> bool:
-    # Deterministic "questionable" heuristic (you can tweak labels later)
+    # questionable-spend heuristic
     if category in {"gambling", "adult", "crypto", "other"}:
         return True
     m = (merchant or "").lower()
@@ -88,9 +86,6 @@ def is_questionable(category: str, merchant: str) -> bool:
     return False
 
 
-# ---------------------------------------------------------------------
-# Core
-# ---------------------------------------------------------------------
 def main() -> None:
     payload = json.loads(sys.stdin.read() or "{}")
     txs: List[Dict[str, Any]] = payload.get("transactions") or []
@@ -102,23 +97,23 @@ def main() -> None:
 
     currency = normalize_currency(txs[0])
 
-    # Totals (all txs)
+    # totals (all txs)
     income_total = 0.0
     spend_total = 0.0
     credits = 0
     debits = 0
 
-    # Rankings (exclude internal transfers)
+    # rankings (exclude internal transfers)
     spend_by_merchant = defaultdict(lambda: {"total": 0.0, "count": 0})
     spend_by_category = defaultdict(lambda: {"total": 0.0, "count": 0})
 
-    # Recurring detection: merchant appears in N distinct months (debit only, non-internal)
+    # recurring detection: merchant appears in N distinct months (debit only, non-internal)
     merchant_months = defaultdict(set)
 
-    # Questionable
+    # questionable
     questionable = defaultdict(lambda: {"total": 0.0, "count": 0})
 
-    # Per-tx ratings (optional, capped)
+    # per-transaction ratings (capped)
     rated_txs = []
 
     excluded_internal = {"count": 0, "total": 0.0}
@@ -129,17 +124,17 @@ def main() -> None:
         raw_type = normalize_type(t)
         ts = normalize_timestamp(t)
 
-        # Credits
+        # credits
         if amt >= 0:
             credits += 1
             income_total += amt
             continue
 
-        # Debits
+        # debits
         debits += 1
         spend_total += -amt
 
-        # Exclude internal transfers from "expense ranking"
+        # exclude internal transfers from expense ranking
         if raw_type in INTERNAL_TYPES:
             excluded_internal["count"] += 1
             excluded_internal["total"] += -amt
@@ -157,12 +152,12 @@ def main() -> None:
         if dt:
             merchant_months[merchant].add(month_key(dt))
 
-        # Flag questionable spend
+        # flag questionable spend
         if is_questionable(cat, merchant):
             questionable[merchant]["total"] += -amt
             questionable[merchant]["count"] += 1
 
-        # Lightweight deterministic "rating" for explainability (optional)
+        # simple risk rating for explainability
         rating = "green"
         if cat in {"subscriptions", "eating_out", "shopping", "leisure", "other"} and (-amt) >= 40:
             rating = "amber"
@@ -180,7 +175,7 @@ def main() -> None:
             }
         )
 
-    # Build rankings
+    # build rankings
     def rank_map_as_list(m: Dict[str, Dict[str, Any]], key_name: str) -> List[Dict[str, Any]]:
         rows = []
         for k, v in m.items():
@@ -200,7 +195,7 @@ def main() -> None:
     top_merchants = rank_map_as_list(spend_by_merchant, "merchant")[: max(top_n, 1)]
     top_categories = rank_map_as_list(spend_by_category, "category")[: max(top_n, 1)]
 
-    # Recurring: appears in >= 3 distinct months (debit only, non-internal)
+    # recurring: appears in >= 3 distinct months (debit only, non-internal)
     recurring = []
     for merch, months in merchant_months.items():
         if len(months) >= 3 and merch in spend_by_merchant:
@@ -215,10 +210,10 @@ def main() -> None:
     recurring.sort(key=lambda x: (-x["months_seen"], -x["total"], x["merchant"].lower()))
     recurring = recurring[: max(top_n, 1)]
 
-    # Questionable list
+    # questionable list
     questionable_list = rank_map_as_list(questionable, "merchant")[: max(top_n, 1)]
 
-    # "Cuts": simple deterministic suggestions from non-essential categories
+    # cuts: suggestions from non-essential categories
     non_essential_categories = {"subscriptions", "eating_out", "shopping", "leisure", "other"}
     cuts = []
     for cat in non_essential_categories:
@@ -226,14 +221,14 @@ def main() -> None:
             cuts.append(
                 {
                     "category": cat,
-                    "monthly_saving_hint": round(spend_by_category[cat]["total"] / 6.0, 2),  # 6mo dataset
+                    "monthly_saving_hint": round(spend_by_category[cat]["total"] / 6.0, 2),  # 6-month dataset
                     "total_6mo": round(spend_by_category[cat]["total"], 2),
                 }
             )
     cuts.sort(key=lambda x: (-x["monthly_saving_hint"], -x["total_6mo"], x["category"]))
     cuts = cuts[: max(top_n, 1)]
 
-    # Cap rated txs for readability
+    # cap rated txs for readability
     rated_txs.sort(key=lambda x: (x["timestamp"], x["merchant"].lower()))
     rated_txs = rated_txs[:200]
 
